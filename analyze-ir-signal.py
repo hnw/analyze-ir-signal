@@ -2,6 +2,82 @@
 import numpy as np
 from sklearn.neighbors import KernelDensity
 
+# Relative tolerance (in percent) for some comparisons on measured data.
+TOLERANCE = 25
+# Lower tolerance for comparison of measured data
+LTOL = 100 - TOLERANCE
+# Upper tolerance for comparison of measured data
+UTOL = 100 + TOLERANCE
+# Resolution of the raw input buffer data. Corresponds to 2 pulses of each 26.3 at 38 kHz.
+MICROS_PER_TICK = 50
+# Value is subtracted from all marks and added to all spaces before decoding, to compensate for the signal forming of different IR receiver modules.
+MARK_EXCESS_MICROS = 20
+
+NEC_ADDRESS_BITS = 16 # 16 bit address or 8 bit address and 8 bit inverted address
+NEC_COMMAND_BITS = 16 # Command and inverted command
+NEC_BITS = (NEC_ADDRESS_BITS + NEC_COMMAND_BITS)
+NEC_UNIT = 560
+NEC_HEADER_MARK  = (16 * NEC_UNIT) # 9000
+NEC_HEADER_SPACE = (8 * NEC_UNIT)  # 4500
+NEC_BIT_MARK     = NEC_UNIT
+NEC_ONE_SPACE    = (3 * NEC_UNIT) # 1690
+NEC_ZERO_SPACE   = NEC_UNIT
+
+PROTOCOL_IS_LSB_FIRST = False
+PROTOCOL_IS_MSB_FIRST = True
+
+def ticks_low(us):
+    return us * LTOL / 100
+
+def ticks_high(us):
+    return us * UTOL / 100 + 1
+
+def match_mark(us, match):
+    passed = ((us >= ticks_low(match + MARK_EXCESS_MICROS)) and (us <= ticks_high(match + MARK_EXCESS_MICROS)));
+    return passed
+
+def match_space(us, match):
+    passed = ((us >= ticks_low(match - MARK_EXCESS_MICROS)) and (us <= ticks_high(match - MARK_EXCESS_MICROS)));
+    return passed
+
+def decode_pulse_distance_data(data, nbits, bitmark, onespace, zerospace, msbfirst):
+    a = data[:len(data)-len(data)%2].reshape(-1,2)
+    decoded = 0
+    if msbfirst:
+        for b in a[:nbits]:
+            if (not match_mark(b[0], bitmark)):
+                print("Mark=%d is not %d" % (b[0], bitmark))
+                return False
+            if match_space(b[1], onespace):
+                decoded = (decoded << 1) | 1
+            elif match_space(b[1], zerospace):
+                decoded = (decoded << 1) | 0
+            else:
+                print("Space=%d is not %d or %d" % (b[1], onespace, zerospace))
+                return False
+    else:
+        mask = 1
+        i = 0
+        for b in a[:nbits]:
+            if i % 8 == 0:
+                mask = 1
+                decoded <<= 8
+            if (not match_mark(b[0], bitmark)):
+                print("Mark=%d is not %d" % (b[0], bitmark))
+                return False
+            if match_space(b[1], onespace):
+                decoded |= mask
+            elif match_space(b[1], zerospace):
+                pass
+            else:
+                print("Space=%d is not %d or %d" % (b[1], onespace, zerospace))
+                return False
+            mask <<= 1
+            i += 1
+
+    print("decoded = %04X" % decoded)
+    return decoded
+
 #C8E880=明?
 
 #131780
@@ -25,7 +101,7 @@ data_darken=[3018,1562,345,1189,372,1147,353,1184,348,423,347,420,346,423,346,42
 # 131740
 data_nightlight=[3020,1557,348,1185,350,1180,350,419,349,421,348,1185,346,419,348,441,327,442,331,1180,348,1184,348,1188,343,424,346,1186,343,419,350,424,345,424,346,419,350,421,350,1201,329,421,347,417,352,419,350,421,348,421,349,8260,3019,1557,351,1183,346,1184,348,422,347,419,347,1204,327,441,328,441,328,437,335,1184,344,1184,349,1185,346,438,331,1185,348,419,346,426,343,420,350,418,350,420,350,1183,352,418,347,417,354,423,344,422,347,417,354,8259,3019,1557,348,1189,343,1184,346,421,345,440,331,1184,346,422,345,424,345,438,331,1186,346,1186,344,1184,345,419,350,1184,347,421,348,417,353,419,347,424,345,424,346,1184,345,423,346,423,346,427,342,419,353,419,345]
 
-data_hitachi=[8917,4558,525,590,525,1725,526,1728,527,590,524,1727,526,606,513,1726,521,592,527,1725,525,594,528,605,509,1727,526,588,531,1723,527,588,532,1736,511,1726,526,588,531,583,533,593,529,1720,529,1723,526,1730,523,588,530,588,528,1722,528,1727,535,1703,537,586,534,603,512,594,525,1728,522,39873,8920,2303,526]
+data_hitachi=[8917,4558,525,590,525,1725,526,1728,527,590,524,1727,526,606,513,1726,521,592,527,1725,525,594,528,605,509,1727,526,588,531,1723,527,588,532,1736,511,1726,526,588,531,583,533,593,529,1720,529,1723,526,1730,523,588,530,588,528,1722,528,1727,535,1703,537,586,534,603,512,594,525,1728,522,39873]
 
 def show_aeha(a):
     a = a[:len(a)-len(a)%2].reshape(-1,2)
@@ -70,5 +146,34 @@ def show_aeha(a):
     
     print("data0 = 0x%01X" % data0)
 
-a = np.array(data_nightlight)
-show_aeha(a)
+
+def decode_nec(rawbuf):
+    # Check we have the right amount of data (68). The +4 is for initial gap, start bit mark and space + stop bit mark.
+    if (len(rawbuf) != 2 * NEC_BITS + 4) and (len(rawbuf) != 4):
+        print("NEC: Data length=%d is not 68 lr 4" % len(rawbuf))
+        return False
+    # Check header "mark" this must be done for repeat and data
+    if (not match_mark(rawbuf[0], NEC_HEADER_MARK)):
+        print("NEC: Header mark length is wrong")
+        return False
+    # Check command header space
+    if (not match_space(rawbuf[1], NEC_HEADER_SPACE)):
+        print("NEC: Header space length is wrong")
+        return False
+    if (not decode_pulse_distance_data(rawbuf[2:], NEC_BITS, NEC_BIT_MARK, NEC_ONE_SPACE, NEC_ZERO_SPACE, PROTOCOL_IS_LSB_FIRST)):
+        return False
+    # Stop bit
+    if (not match_mark(rawbuf[2 + (2 * NEC_BITS)], NEC_BIT_MARK)):
+        print("NEC: Stop bit mark length is wrong")
+        return False
+
+
+
+    
+            
+#a = np.array(data_nightlight)
+a = np.array(data_hitachi)
+#show_aeha(a)
+decode_nec(a)
+
+
